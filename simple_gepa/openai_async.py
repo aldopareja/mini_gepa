@@ -25,8 +25,9 @@ async def get_client() -> AsyncOpenAI:
     _client = AsyncOpenAI(
         max_retries=5, 
         timeout=1800, 
-        base_url="http://localhost:8000/v1"
+        # base_url="http://localhost:8000/v1"
     )
+    _client.responses.create
     _client_loop = loop
     return _client
 
