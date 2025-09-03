@@ -1,0 +1,23 @@
+[project]
+name = "simple-gepa"
+version = "0.1.0"
+description = "A minimal, readable local-optimizer with a simple GEPA-style adapter example"
+readme = "Readme.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "arc-flow" }
+]
+
+dependencies = [
+  "openai>=1.40",
+  "datasets>=2.19",
+  "tenacity>=8.2",
+  "typer>=0.12",
+]
+
+[project.urls]
+Homepage = "https://example.com"
+
+[tool.typer]
+completion = true
