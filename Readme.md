@@ -5,7 +5,11 @@ A minimal, readable local optimizer with a simple GEPA-style adapter example on 
 Quickstart (requires OPENAI_API_KEY):
 
 ```bash
-uv run python -m simple_gepa.examples.demo.aime_demo.py --model gpt-5 --max-metric-calls 200 --minibatch-size 3 --lanes 8 --run-dir runs/aime_minimal
+# cd <root>
+uv venv -p 3.12 --managed-python
+uv pip install -e .
+cd examples/demo
+python aime_demo.py --model gpt-5 --max-metric-calls 200 --minibatch-size 3 --lanes 8 --run-dir runs/aime_minimal --reasoning-effort low
 ```
 
 - Dataset: AIME (loaded via Hugging Face `datasets`)
