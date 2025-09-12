@@ -1,0 +1,42 @@
+digraph GEPA_Full {
+    rankdir=LR;
+    node [shape=box, style=rounded, fontname="Arial", fontsize=10];
+    edge [fontname="Arial", fontsize=9];
+    
+    // Candidate Pool (on the left)
+    subgraph cluster_pool {
+        label="Candidate Pool";
+        style=filled;
+        fillcolor="#f0f8ff";
+        fontsize=11;
+        pool [label="c₁\nc₂\nc₃\n...\ncₙ", shape=box, style=filled, fillcolor=white, width=0.8];
+    }
+    
+    // Selection
+    select [label="Select from\nPareto Front", shape=diamond, style=filled, fillcolor="#e8f4f8"];
+    
+    // Main iteration flow
+    start [label="Candidate\n+\nMinibatch", shape=ellipse, style=filled, fillcolor="#e8f4f8"];
+    eval1 [label="Evaluate\n(with traces)", style=filled, fillcolor="#fff2cc"];
+    improve [label="Propose\nImprovement", shape=diamond, style=filled, fillcolor="#d4edda"];
+    eval2 [label="Re-evaluate", style=filled, fillcolor="#fff2cc"];
+    accept [label="Accept?", shape=diamond, style=filled, fillcolor="#f8d7da"];
+    fulleval [label="Full\nValidation", style=filled, fillcolor="#cce5ff"];
+    
+    // Main flow connections
+    pool -> select [label="Pareto\nsampling"];
+    select -> start;
+    start -> eval1 [label="score₁"];
+    eval1 -> improve [label="feedback"];
+    improve -> eval2 [label="new"];
+    eval2 -> accept [label="score₂"];
+    accept -> fulleval [label="score₂ > score₁", color="green", fontcolor="green", fontsize=8];
+    
+    // Feedback loops
+    accept -> select [label="reject", style=dashed, color="red", fontcolor="red", constraint=false];
+    fulleval -> pool [label="add to\npool", style=bold, color="blue", fontcolor="blue", constraint=false];
+    
+    // Layout hints to keep things horizontal
+    {rank=same; eval1; improve; eval2;}
+    {rank=same; start; accept;}
+}

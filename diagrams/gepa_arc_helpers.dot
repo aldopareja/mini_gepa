@@ -1,0 +1,38 @@
+digraph ARC_Helpers {
+    rankdir=LR;
+    node [shape=box, style=rounded, fontname="Arial", fontsize=10];
+    edge [fontname="Arial", fontsize=9];
+    
+    // Helper Functions Library (Candidate)
+    helpers [label="Helper Functions\n────────\nrotate_grid()\nfind_pattern()\nflood_fill()\n...", shape=note, style=filled, fillcolor="#e8f4f8", width=1.5];
+    
+    // Evaluation: Model solving ARC tasks
+    eval [label="Model Solves\nARC Tasks", shape=box, style=filled, fillcolor="#fff2cc"];
+    
+    // Code execution representation
+    code [label="uses helpers +\ngeneral Python", shape=plaintext, fontsize=9, fontcolor="#666666"];
+    
+    // Trajectories/Usage patterns
+    trajectories [label="Execution\nTrajectories", shape=box, style=filled, fillcolor="#f0f0f0"];
+    
+    // Improvement: Mutation decision
+    mutate [label="Add/Remove\nHelpers", shape=diamond, style=filled, fillcolor="#d4edda"];
+    
+    // New helper library
+    new_helpers [label="Updated Functions\n────────\nrotate_grid()\nfind_symmetry()\ncount_colors()\n...", shape=note, style=filled, fillcolor="#cce5ff", width=1.5];
+    
+    // Connections
+    helpers -> eval [label="provides"];
+    eval -> trajectories [label="logs usage"];
+    trajectories -> mutate [label="analyze\npatterns"];
+    mutate -> new_helpers [label="evolve"];
+    
+    // Feedback loop
+    new_helpers -> helpers [label="iterate", style=dashed, color="#666666", constraint=false];
+    
+    // Position code annotation near eval
+    eval -> code [style=invis];
+    
+    // Layout hints
+    {rank=same; eval; code;}
+}
