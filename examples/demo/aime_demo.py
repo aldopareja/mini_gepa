@@ -9,10 +9,10 @@ import typer
 
 from datasets import load_dataset
 
-from simple_gepa.core import optimize
-from simple_gepa.types import EvaluationBatch
-from simple_gepa.persistence import write_run_config
-from simple_gepa.openai_async import responses_create
+from mini_gepa.core import optimize
+from mini_gepa.types import EvaluationBatch
+from mini_gepa.persistence import write_run_config
+from mini_gepa.openai_async import responses_create
 
 
 app = typer.Typer(help="Minimal GEPA-style local optimizer demo on AIME with a simple adapter.")

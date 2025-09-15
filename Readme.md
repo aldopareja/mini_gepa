@@ -1,4 +1,4 @@
-# simple-gepa
+# mini-gepa
 
 A minimal implementation of GEPA (Gradient-Estimated Program Adaptation) for prompt optimization.
 
