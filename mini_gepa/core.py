@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Awaitable, List, Optional, Tuple
 
 from .pareto import select_candidate_from_pareto_front
-from .sampler import EpochShuffledBatchSampler
+from .sampler import Sampler, EpochShuffledBatchSampler, AdaptiveVarianceSampler
 from .types import CandidateProposal, DataInst, EvaluationBatch, RolloutOutput
 from .persistence import resume_checkpoint, save_checkpoint_and_best
 
@@ -72,7 +72,7 @@ class OptimizationState:
         valset_subscores: List[float],
         run_dir: Optional[str],
         num_metric_calls_by_discovery_of_new_candidate: int,
-    ) -> None:
+    ) -> int:
         new_candidate_idx = len(self.candidates)
         self.candidates.append(new_candidate)
         self.num_metric_calls_by_discovery.append(
@@ -95,6 +95,7 @@ class OptimizationState:
                 self.pareto_front_candidates_by_task[task_idx] = {new_candidate_idx}
             elif new_score == old_score:
                 self.pareto_front_candidates_by_task[task_idx].add(new_candidate_idx)
+        return new_candidate_idx
 
 
 async def initialize_state(
@@ -137,7 +138,9 @@ async def propose_once(
     curr_prog_id: int,
     curr_prog: dict[str, str],
     minibatch: List[DataInst],
+    subsample_indices: List[int],
     adapter: Any,
+    sampler: Sampler,
     components_to_update: List[str],
     perfect_score: float,
     skip_perfect_score: bool,
@@ -153,6 +156,8 @@ async def propose_once(
     eval_curr: EvaluationBatch = await adapter.evaluate(
         minibatch, curr_prog, capture_traces=True
     )
+    # record attempt-level training outcomes for current candidate
+    sampler.record_attempts(curr_prog_id, subsample_indices, eval_curr.attempt_scores)
 
     if (
         skip_perfect_score
@@ -196,9 +201,11 @@ async def propose_once(
         CandidateProposal(
             candidate=new_candidate,
             parent_program_ids=[curr_prog_id],
-            subsample_indices=list(range(len(minibatch))),  # placeholder indices
+            subsample_indices=list(subsample_indices),
             subsample_scores_before=list(eval_curr.scores or []),
             subsample_scores_after=list(eval_new.scores or []),
+            subsample_attempt_scores_before=list(eval_curr.attempt_scores or []),
+            subsample_attempt_scores_after=list(eval_new.attempt_scores or []),
             tag="reflective_mutation",
         ),
         True,
@@ -224,7 +231,7 @@ class Optimizer:
         max_metric_calls: int,
         perfect_score: float,
         adapter: Any,
-        sampler: EpochShuffledBatchSampler,
+        sampler: Sampler,
         rng: random.Random,
         skip_perfect_score: bool = True,
         raise_on_exception: bool = True,
@@ -266,7 +273,7 @@ class Optimizer:
         new_program: dict[str, str],
         state: OptimizationState,
         parent_program_idx: List[int],
-    ) -> None:
+    ) -> int:
         num_metric_calls_by_discovery = state.total_num_evals
         vh, vt = get_candidate_head_and_tail(new_program)
         self.log(f"Validation eval: head='{vh}' tail='{vt}'")
@@ -274,7 +281,7 @@ class Optimizer:
         # Atomic state update (no awaits)
         state.num_full_ds_evals += 1
         state.total_num_evals += len(valset_subscores)
-        state.update_with_new_candidate(
+        new_id = state.update_with_new_candidate(
             parent_candidate_idx=parent_program_idx,
             new_candidate=new_program,
             valset_outputs=valset_outputs,
@@ -282,6 +289,7 @@ class Optimizer:
             run_dir=self.run_dir,
             num_metric_calls_by_discovery_of_new_candidate=num_metric_calls_by_discovery,
         )
+        return new_id
 
     async def run(self, lanes: int) -> OptimizationState:
         # Attempt resume from checkpoint if available
@@ -330,7 +338,7 @@ class Optimizer:
             state.i = iteration_num
             # Subsample minibatch deterministically based on iteration
             subsample_ids = self.sampler.next_minibatch_indices(
-                len(self.trainset), iteration_num - 1
+                len(self.trainset), iteration_num - 1, curr_prog_id
             )
             minibatch = [self.trainset[j] for j in subsample_ids]
             self.log(
@@ -357,7 +365,9 @@ class Optimizer:
                         ),
                         curr_prog=curr_prog,
                         minibatch=minibatch,
+                        subsample_indices=subsample_ids,
                         adapter=self.adapter,
+                        sampler=self.sampler,
                         components_to_update=components_to_update,
                         perfect_score=self.perfect_score,
                         skip_perfect_score=self.skip_perfect_score,
@@ -372,10 +382,16 @@ class Optimizer:
                     if proposal is None:
                         continue
 
-                    await self._run_full_eval_and_add(
+                    new_id = await self._run_full_eval_and_add(
                         new_program=proposal.candidate,
                         state=state,
                         parent_program_idx=proposal.parent_program_ids,
+                    )
+                    # record attempt-level outcomes for the newly accepted candidate
+                    self.sampler.record_attempts(
+                        new_id,
+                        subsample_ids,
+                        proposal.subsample_attempt_scores_after,
                     )
                 except Exception as e:
                     self.log(f"[lane {lane_id}] Exception during optimization: {e}")
@@ -424,7 +440,7 @@ async def optimize(
         )
         return eval_out.outputs, eval_out.scores
 
-    sampler = EpochShuffledBatchSampler(minibatch_size=minibatch_size, rng=rng)
+    sampler = AdaptiveVarianceSampler(minibatch_size=minibatch_size, rng=rng)
 
     engine = Optimizer(
         run_dir=run_dir,

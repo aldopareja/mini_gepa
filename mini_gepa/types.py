@@ -13,6 +13,7 @@ RolloutOutput = Dict[str, Any]
 class EvaluationBatch:
     outputs: List[RolloutOutput]
     scores: List[float]
+    attempt_scores: List[List[float]]
     trajectories: Optional[List[Dict[str, Any]]] = None
 
 
@@ -23,4 +24,6 @@ class CandidateProposal:
     subsample_indices: List[int]
     subsample_scores_before: List[float]
     subsample_scores_after: List[float]
+    subsample_attempt_scores_before: List[List[float]]
+    subsample_attempt_scores_after: List[List[float]]
     tag: str = "reflective_mutation"

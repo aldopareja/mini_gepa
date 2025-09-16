@@ -75,7 +75,7 @@ class AIMEAdapter:
         resp = await responses_create(**req)
         return getattr(resp, "output_text", "") or ""
 
-    async def _score_instance(self, example: Dict[str, Any], candidate: Dict[str, str], attempts: int, sem: asyncio.Semaphore) -> tuple[Dict[str, Any], float, Dict[str, Any]]:
+    async def _score_instance(self, example: Dict[str, Any], candidate: Dict[str, str], attempts: int, sem: asyncio.Semaphore) -> tuple[Dict[str, Any], float, Dict[str, Any], List[float]]:
         system_prompt = candidate.get("system_prompt", "")
         user_input = str(example["input"])
         expected = str(example["answer"])  # already "### <answer>"
@@ -88,8 +88,8 @@ class AIMEAdapter:
         responses = await asyncio.gather(*(once() for _ in range(max(1, int(attempts)))))
 
         # Simple metric: 1.0 if expected substring appears in response, else 0.0; average over attempts
-        scores = [1.0 if expected in r else 0.0 for r in responses]
-        mean_score = sum(scores) / len(scores) if scores else 0.0
+        attempt_scores = [1.0 if expected in r else 0.0 for r in responses]
+        mean_score = sum(attempt_scores) / len(attempt_scores) if attempt_scores else 0.0
 
         # Keep last response for outputs
         output = {"full_assistant_response": '\n'.join(responses) if responses else ""}
@@ -98,7 +98,7 @@ class AIMEAdapter:
             "Generated Outputs": '\n'.join(responses) if responses else "",
             "Expected_Answer_String": expected,
         }
-        return output, mean_score, trace
+        return output, mean_score, trace, attempt_scores
 
     async def evaluate(
         self,
@@ -112,18 +112,20 @@ class AIMEAdapter:
 
         outs: List[Dict[str, Any]] = []
         scores: List[float] = []
+        attempt_scores: List[List[float]] = []
         traces: Optional[List[Dict[str, Any]]] = [] if capture_traces else None
 
         results = await asyncio.gather(
             *(self._score_instance(ex, candidate, att, sem) for ex in batch)
         )
-        for output, score, trace in results:
+        for output, score, trace, per_attempt in results:
             outs.append(output)
             scores.append(score)
+            attempt_scores.append(per_attempt)
             if capture_traces and traces is not None:
                 traces.append(trace)
 
-        return EvaluationBatch(outputs=outs, scores=scores, trajectories=traces)
+        return EvaluationBatch(outputs=outs, scores=scores, attempt_scores=attempt_scores, trajectories=traces)
 
     def make_reflective_dataset(
         self,
