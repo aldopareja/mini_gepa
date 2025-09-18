@@ -1,101 +1,132 @@
 from __future__ import annotations
 
+from collections import defaultdict
+from dataclasses import dataclass
+from statistics import mean
+from typing import Dict, List
 import random
-from typing import Dict, List, Set
 
+from .types import Candidate
+from .adapter import EvaluationBatch
 
-def _is_dominated(
-    y: int,
-    other_programs: Set[int],
-    program_at_pareto_front_valset: List[Set[int]],
-) -> bool:
-    """Return True if candidate y is dominated across all fronts.
+CandidateIdx = int
+TaskIdx = int
 
-    A candidate y is considered dominated if, for every front that contains y,
-    there exists at least one other program from other_programs also in that front.
+@dataclass
+class ParetoFrontEntry:
+    candidate: Candidate
+    candidate_idx: CandidateIdx
+    eval_results: EvaluationBatch
+
+@dataclass
+class ParetoFrontier:
+    entries: List[ParetoFrontEntry]
+
+def add_candidate(frontier: ParetoFrontier, candidate: Candidate, eval_results: EvaluationBatch) -> ParetoFrontier:
+    """Add a candidate to the candidates dictionary."""
+    candidates = frontier.entries
+    candidate_idx = len(candidates)
+    assert candidates[0].eval_results.get_unique_tasks() == eval_results.get_unique_tasks() if candidates else True
+    candidates.append(ParetoFrontEntry(candidate, candidate_idx, eval_results))
+    return frontier
+
+ParetoMatrix = Dict[TaskIdx, Dict[CandidateIdx, float]]
+
+def _get_pareto_matrix(frontier: ParetoFrontier) -> ParetoMatrix:
+    """Compute a matrix where rows are task_ids, columns are candidate_ids, 
+    and elements are the mean score of each candidate on each task."""
+    
+    # Get all task IDs from the first candidate
+    first_candidate = frontier.entries[0]
+    task_ids = first_candidate.eval_results.get_unique_tasks()
+    
+    # Initialize matrix as dict of dicts
+    matrix = defaultdict(dict)
+    for task_id in task_ids:
+        for entry in frontier.entries:
+            # Get max score for this candidate on this task
+            matrix[task_id][entry.candidate_idx] = entry.eval_results.mean_score_per_task()[task_id]
+    
+    return matrix
+
+AggScores = Dict[CandidateIdx, float]
+
+def _get_candidate_mean_scores(pareto_matrix: ParetoMatrix) -> AggScores:
+    """Compute mean scores across all tasks for each candidate."""
+    candidate_indices = pareto_matrix[0].keys()
+    task_indices = pareto_matrix.keys()
+    
+    agg_scores = {}
+    for candidate_idx in candidate_indices:
+        candidate_scores_across_tasks = [pareto_matrix[task_id][candidate_idx] for task_id in task_indices]
+        agg_scores[candidate_idx] = mean(candidate_scores_across_tasks)
+    
+    return agg_scores
+    
+def _remove_dominated_candidates(pareto_matrix: ParetoMatrix, agg_scores: AggScores) -> ParetoMatrix:
     """
-    y_fronts = [front for front in program_at_pareto_front_valset if y in front]
-    for front in y_fronts:
-        found_dominator_in_front = False
-        for other_prog in front:
-            if other_prog in other_programs:
-                found_dominator_in_front = True
-                break
-        if not found_dominator_in_front:
-            return False
-    return True
-
-
-def _remove_dominated_programs(
-    program_at_pareto_front_valset: List[Set[int]],
-    scores: List[float] | Dict[int, float] | None,
-) -> List[Set[int]]:
-    """Filter out dominated programs from all fronts.
-
-    Mirrors the simplified GEPA behavior used for candidate selection.
+    Find candidates that are not dominated by any other candidate across all tasks.
+    
+    A candidate is considered a "dominator" (non-dominated) if there exists at least one task
+    where it performs strictly better than all other candidates. In other words, a candidate
+    is dominated if for every task, there exists another candidate that performs at least as good.
     """
-    # Count frequency of appearances across fronts to determine the candidate set
-    freq: Dict[int, int] = {}
-    for front in program_at_pareto_front_valset:
-        for p in front:
-            freq[p] = freq.get(p, 0) + 1
+    
+    task_indices = pareto_matrix.keys()
 
-    dominated: Set[int] = set()
-    programs: List[int] = list(freq.keys())
+    ordered_candidate_indices = sorted(agg_scores.keys(), key=lambda x: agg_scores[x], reverse=False)
+    dominators = set(ordered_candidate_indices)
+    
+    def _dominates_in_task(task_id: TaskIdx, candidate_idx: CandidateIdx) -> bool:
+        """
+        A candidate dominates if it is the only one with the max score on that task
+        """
+        front = pareto_matrix[task_id]
+        max_score = max(front.values())
+        best_candidate_indices = list(filter(lambda candidate_idx: front[candidate_idx] == max_score, dominators))
+        return len(best_candidate_indices) == 1 and candidate_idx in best_candidate_indices
 
-    if scores is None:
-        score_map: Dict[int, float] = {p: 1.0 for p in programs}
-    elif isinstance(scores, dict):
-        score_map = scores  # assume provides all needed indices
-    else:
-        score_map = {i: scores[i] for i in programs}
-
-    # Sort from lowest to highest score to eliminate weaker programs first
-    programs_sorted = sorted(programs, key=lambda x: score_map[x], reverse=False)
-
-    found_to_remove = True
-    while found_to_remove:
-        found_to_remove = False
-        remaining: Set[int] = set(programs_sorted).difference(dominated)
-        for y in programs_sorted:
-            if y in dominated:
+    removed = True
+    while removed:
+        removed = False
+        for candidate_idx in ordered_candidate_indices:
+            if candidate_idx not in dominators:
                 continue
-            others = remaining.difference({y})
-            if _is_dominated(y, others, program_at_pareto_front_valset):
-                dominated.add(y)
-                found_to_remove = True
-                break
+            if not any(_dominates_in_task(task_id, candidate_idx) for task_id in task_indices):
+                dominators.remove(candidate_idx)
+                removed = True
+    
+    new_pareto_matrix = defaultdict(dict)
+    for task_id in task_indices:
+        for candidate_idx, score in pareto_matrix[task_id].items():
+            if candidate_idx in dominators:
+                new_pareto_matrix[task_id][candidate_idx] = score
+    
+    return new_pareto_matrix
 
-    dominators = [p for p in programs_sorted if p not in dominated]
+def _sample_based_on_frequency(pareto_matrix: ParetoMatrix, rng: random.Random) -> int:
+    
+    def _wins_in_task(candidate_idx: CandidateIdx, task_id: TaskIdx) -> bool:
+        front = pareto_matrix[task_id]
+        candidate_score = front[candidate_idx]
+        return candidate_score == max(front.values())    
+    
+    win_counts: Dict[CandidateIdx, int] = defaultdict(int)
 
-    # Keep only dominators in each front
-    new_program_at_pareto_front_valset = [
-        {prog_idx for prog_idx in front if prog_idx in dominators}
-        for front in program_at_pareto_front_valset
-    ]
-    return new_program_at_pareto_front_valset
-
-
-def select_candidate_from_pareto_front(
-    program_at_pareto_front_valset: List[Set[int]],
-    agg_scores: List[float],
-    rng: random.Random,
-) -> int:
-    """Frequency-weighted sampling over non-dominated Pareto fronts.
-
-    1) Remove dominated programs (based on fronts + scores ordering)
-    2) Count frequency across remaining fronts
-    3) Sample proportional to frequency
-    """
-    pruned_fronts = _remove_dominated_programs(
-        program_at_pareto_front_valset, agg_scores
-    )
-
-    freq: Dict[int, int] = {}
-    for front in pruned_fronts:
-        for prog_idx in front:
-            freq[prog_idx] = freq.get(prog_idx, 0) + 1
-
-    sampling_list = [prog_idx for prog_idx, count in freq.items() for _ in range(count)]
+    candidate_indices = pareto_matrix[0].keys()
+    task_indices = pareto_matrix.keys()
+    win_counts = {candidate_idx: sum(_wins_in_task(candidate_idx, task_id) for task_id in task_indices) for candidate_idx in candidate_indices}
+    
+    sampling_list = [candidate_idx for candidate_idx, count in win_counts.items() for _ in range(count)]
     assert len(sampling_list) > 0
     return rng.choice(sampling_list)
+
+
+def select_candidate_from_pareto_front(frontier: ParetoFrontier, rng: random.Random) -> int:
+    pareto_matrix = _get_pareto_matrix(frontier)
+    agg_scores = _get_candidate_mean_scores(pareto_matrix)
+    
+    new_pareto_matrix = _remove_dominated_candidates(pareto_matrix, agg_scores)
+
+    candidate_idx = _sample_based_on_frequency(new_pareto_matrix, rng)
+    return candidate_idx

@@ -24,10 +24,9 @@ async def get_client() -> AsyncOpenAI:
 
     _client = AsyncOpenAI(
         max_retries=5, 
-        timeout=1800, 
+        timeout=600, 
         # base_url="http://localhost:8000/v1"
     )
-    _client.responses.create
     _client_loop = loop
     return _client
 
@@ -52,14 +51,17 @@ async def call_with_client(coro_factory: Callable[[AsyncOpenAI], Awaitable[T]]) 
     """Execute an async API call with retry; recreate client on timeouts and specific errors."""
     try:
         client = await get_client()
-        return await coro_factory(client)
+        result =  await coro_factory(client)
+        return result
     except openai.APITimeoutError:
         reset_client()
+        # from ipdb import set_trace; set_trace()
         raise
     except openai.BadRequestError as e:
         # Check for the specific error message about 'NoneType' object has no attribute 'startswith'
-        if "'NoneType' object has no attribute 'startswith'" in str(e):
-            reset_client()
+        import traceback
+        traceback.print_exc()
+        # from ipdb import set_trace; set_trace()
         raise
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from itertools import chain
 import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -9,9 +10,8 @@ import typer
 
 from datasets import load_dataset
 
-from mini_gepa.core import optimize
-from mini_gepa.types import EvaluationBatch
-from mini_gepa.persistence import write_run_config
+from mini_gepa.core import DataExample, optimize
+from mini_gepa.adapter import Candidate, ComponentName, EvaluationBatch, AttemptEvalOutput
 from mini_gepa.openai_async import responses_create
 
 
@@ -52,16 +52,13 @@ def load_aime_splits(train_size: Optional[int] = None, val_size: Optional[int] =
 @dataclass
 class AIMEAdapter:
     model: str
-    train_attempts: int = 1
-    val_attempts: int = 1
     max_concurrency: int = 32
     reasoning_effort: Optional[str] = None  # e.g., "high" for models that support it
 
-    # Components API
     def components(self) -> List[str]:
         return ["system_prompt"]
 
-    async def _one_call(self, system_prompt: str, user_input: str) -> str:
+    async def _one_call(self, system_prompt: str, user_input: str, sem: asyncio.Semaphore) -> str:
         req: Dict[str, Any] = {
             "model": self.model,
             "input": [
@@ -71,117 +68,83 @@ class AIMEAdapter:
         }
         if self.reasoning_effort is not None:
             req["reasoning"] = {"effort": self.reasoning_effort}
+        async with sem:
+            resp = await responses_create(**req)
+            return getattr(resp, "output_text", "") or ""
 
-        resp = await responses_create(**req)
-        return getattr(resp, "output_text", "") or ""
+    async def _score_instance(self, task_idx: int, example: DataExample, candidate: Candidate, attempts: int, sem: asyncio.Semaphore) -> List[AttemptEvalOutput]:
+        system_prompt = candidate["system_prompt"]
+        user_input = example["input"]
+        expected = example["answer"]  # e.g. "### <answer>"
+        
+        calls = [self._one_call(system_prompt, user_input, sem) for _ in range(max(1, int(attempts)))]
+        responses = await asyncio.gather(*calls)
 
-    async def _score_instance(self, example: Dict[str, Any], candidate: Dict[str, str], attempts: int, sem: asyncio.Semaphore) -> tuple[Dict[str, Any], float, Dict[str, Any], List[float]]:
-        system_prompt = candidate.get("system_prompt", "")
-        user_input = str(example["input"])
-        expected = str(example["answer"])  # already "### <answer>"
-
-        async def once() -> str:
-            async with sem:
-                return await self._one_call(system_prompt, user_input)
-
-        # Run attempts fully async without bottlenecking the entire loop
-        responses = await asyncio.gather(*(once() for _ in range(max(1, int(attempts)))))
-
-        # Simple metric: 1.0 if expected substring appears in response, else 0.0; average over attempts
-        attempt_scores = [1.0 if expected in r else 0.0 for r in responses]
-        mean_score = sum(attempt_scores) / len(attempt_scores) if attempt_scores else 0.0
-
-        # Keep last response for outputs
-        output = {"full_assistant_response": '\n'.join(responses) if responses else ""}
-        trace = {
-            "Inputs": user_input,
-            "Generated Outputs": '\n'.join(responses) if responses else "",
-            "Expected_Answer_String": expected,
-        }
-        return output, mean_score, trace, attempt_scores
+        attempt_eval_outputs: List[AttemptEvalOutput] = []
+        for i, r in enumerate(responses):
+            score = 1.0 if expected in r else 0.0
+            trace = {
+                "Inputs": user_input,
+                "Generated Outputs": r,
+                "Score": score,
+                "Expected_Answer_String": expected,
+            }
+            attempt_eval_outputs.append(
+                AttemptEvalOutput(
+                    task_idx=task_idx,
+                    candidate=candidate,
+                    attempt_idx=i,
+                    rollout_output=r,
+                    trace=trace,
+                    score=score
+                )
+            )
+        return attempt_eval_outputs
 
     async def evaluate(
         self,
-        batch: List[Dict[str, Any]],
-        candidate: Dict[str, str],
-        capture_traces: bool = False,
-        attempts: Optional[int] = None,
+        batch: List[DataExample],
+        candidate: Candidate,
+        attempts: int,
     ) -> EvaluationBatch:
-        att = attempts if attempts is not None else self.train_attempts
         sem = asyncio.Semaphore(self.max_concurrency)
 
-        outs: List[Dict[str, Any]] = []
-        scores: List[float] = []
-        attempt_scores: List[List[float]] = []
-        traces: Optional[List[Dict[str, Any]]] = [] if capture_traces else None
+        tasks = [self._score_instance(idx, ex, candidate, attempts, sem) for idx, ex in enumerate(batch)]
+        eval_outputs = await asyncio.gather(*tasks)
 
-        results = await asyncio.gather(
-            *(self._score_instance(ex, candidate, att, sem) for ex in batch)
+        return EvaluationBatch(
+            batch_results=list(chain(*eval_outputs)), # flatten list of lists
         )
-        for output, score, trace, per_attempt in results:
-            outs.append(output)
-            scores.append(score)
-            attempt_scores.append(per_attempt)
-            if capture_traces and traces is not None:
-                traces.append(trace)
-
-        return EvaluationBatch(outputs=outs, scores=scores, attempt_scores=attempt_scores, trajectories=traces)
-
-    def make_reflective_dataset(
-        self,
-        candidate: Dict[str, str],
-        eval_batch: EvaluationBatch,
-        components_to_update: List[str],
-    ) -> Dict[str, List[Dict[str, Any]]]:
-        # Minimal reflective dataset using the outputs and any traces
-        comp = components_to_update[0]
-        records: List[Dict[str, Any]] = []
-        outputs = eval_batch.outputs
-        scores = eval_batch.scores
-        traces = eval_batch.trajectories or [None] * len(outputs)
-
-        for out, score, trace in zip(outputs, scores, traces, strict=False):
-            gen = (out or {}).get("full_assistant_response", "")
-            feedback = "Response includes correct answer." if score > 0.5 else "Response missing the exact required answer string."
-            record = {
-                "Generated Outputs": gen,
-                "Feedback": feedback,
-            }
-            if isinstance(trace, dict):
-                record.update({**trace})
-            records.append(record)
-
-        return {comp: records}
 
     async def propose_new_texts(
         self,
-        candidate: Dict[str, str],
-        reflective_dataset: Dict[str, List[Dict[str, Any]]],
-        components_to_update: List[str],
-    ) -> Dict[str, str]:
-        # Very simple teacher prompt to rewrite system_prompt
-        out: Dict[str, str] = {}
-        for comp in components_to_update:
-            examples = reflective_dataset.get(comp, [])
-            current_text = candidate.get(comp, "")
-            prompt = (
-                "You are optimizing an instruction for solving AIME-style math problems.\n"
-                "Your goal is to rewrite the current system prompt to improve the performance of the assistant.\n"
-                "Current system prompt:\n" + current_text + "\n\n"
-                "Here are some example model responses and feedback:\n" + json.dumps(examples[:10], indent=2) + "\n\n"
-                "carefully consider the feedback and the model responses to improve the system prompt.\n"
-                "Return only the improved system prompt text, with no extra commentary."
-            )
-            req: Dict[str, Any] = {
-                "model": self.model,
-                "input": [{"role": "user", "content": prompt}],
-            }
-            if self.reasoning_effort is not None:
-                req["reasoning"] = {"effort": self.reasoning_effort}
-            resp = await responses_create(**req)
-            improved = resp.output_text
-            out[comp] = improved
-        return out
+        candidate: Candidate,
+        eval_batch: EvaluationBatch,
+        component_to_update: ComponentName,
+    ) -> Candidate:
+        trajectories = [e.trace for e in eval_batch.batch_results]
+
+
+        current_text = candidate.get(component_to_update, "")
+        prompt = (
+            "You are optimizing an instruction for solving AIME-style math problems.\n"
+            "Your goal is to rewrite the current system prompt to improve the performance of the assistant.\n"
+            f"Current system prompt:\n{current_text}\n\n"
+            f"Here are some example model responses and feedback:\n{json.dumps(trajectories[:10], indent=2)}\n\n"
+            "Carefully consider the feedback and the model responses to improve the system prompt.\n"
+            "Return only the improved system prompt text, with no extra commentary."
+        )
+        req: Dict[str, Any] = {
+            "model": self.model,
+            "input": [{"role": "user", "content": prompt}],
+        }
+        if self.reasoning_effort is not None:
+            req["reasoning"] = {"effort": self.reasoning_effort}
+        resp = await responses_create(**req)
+        improved = getattr(resp, "output_text", "") or ""
+        new_candidate = dict(candidate)
+        new_candidate[component_to_update] = improved
+        return new_candidate
 
 
 # -----------------------------
@@ -194,14 +157,13 @@ def run(
     model: str = typer.Option("gpt-4.1-mini", help="OpenAI model for both actor and teacher"),
     reasoning_effort: Optional[str] = typer.Option(None, help="Reasoning effort to pass to the API (e.g., 'high')"),
     train_size: int = typer.Option(12, help="Num training instances (<= available)"),
-    val_size: int = typer.Option(12, help="Num validation instances (<= available)"),
+    val_size: int = typer.Option(3, help="Num validation instances (<= available)"),
     train_attempts: int = typer.Option(1, help="Attempts per example during training minibatches"),
     val_attempts: int = typer.Option(1, help="Attempts per example during validation"),
     minibatch_size: int = typer.Option(3, help="Training minibatch size"),
     lanes: int = typer.Option(8, help="Number of concurrent optimizer lanes"),
-    max_metric_calls: int = typer.Option(200, help="Total evaluation budget (minibatch elements counted)"),
-    run_dir: str = typer.Option("runs/aime_minimal", help="Directory for checkpoints and artifacts"),
-    seed: int = typer.Option(0, help="Random seed for optimizer"),
+    max_iterations: int = typer.Option(200, help="Max number of optimization iterations"),
+    run_dir: str = typer.Option('run', help="Run directory"),
 ):
     """Run a minimal GEPA-style optimization on AIME with a simple adapter.
 
@@ -224,45 +186,24 @@ def run(
 
         adapter = AIMEAdapter(
             model=model,
-            train_attempts=train_attempts,
-            val_attempts=val_attempts,
             max_concurrency=64,
             reasoning_effort=reasoning_effort,
         )
 
-        write_run_config(
-            run_dir,
-            {
-                "model": model,
-                "train_size": train_size,
-                "val_size": val_size,
-                "train_attempts": train_attempts,
-                "val_attempts": val_attempts,
-                "minibatch_size": minibatch_size,
-                "lanes": lanes,
-                "max_metric_calls": max_metric_calls,
-                "seed": seed,
-                "reasoning_effort": reasoning_effort,
-            },
-        )
-
-        result = await optimize(
-            seed_candidate=seed_candidate,
+        await optimize(
+            adapter=adapter,
             trainset=trainset,
             valset=valset,
-            adapter=adapter,
-            skip_perfect_score=True,
-            minibatch_size=minibatch_size,
+            seed_candidate=seed_candidate,
+            train_attempts=train_attempts,
+            val_attempts=val_attempts,
             lanes=lanes,
+            minibatch_size=minibatch_size,
+            max_iterations=max_iterations,
             perfect_score=1.0,
-            max_metric_calls=max_metric_calls,
+            skip_perfect_score=True,
             run_dir=run_dir,
-            seed=seed,
-            raise_on_exception=True,
         )
-
-        typer.echo("Best score: " + str(result.best_score))
-        typer.echo("Best program: \n" + json.dumps(result.best_program, indent=2))
 
     asyncio.run(_main())
 
